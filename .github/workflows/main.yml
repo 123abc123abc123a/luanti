@@ -55,14 +55,16 @@ jobs:
 
       - name: Build for iPhone Hardware
         run: |
-          # FIX: Patch both lowercase and CamelCase instances to fully align SDK paths
+          # 1. Change lowercase target platform to compile for a device
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/build_ios.sh
-          sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/build_ios.sh
+          
+          # 2. FIX: Precisely patch SDK directory traversal without messing up the dependencies path
+          sed -i '' 's/\.\.\/iPhoneSimulator/\.\.\/iPhoneOS/g' util/ci/build_ios.sh
           
           mkdir build
           cd build
           
-          # Use the populated dependencies tree directory so CMake successfully resolves Zstd
+          # Use the populated simulator folder (unmodified by sed) where Zstd is located
           export DEPS_DIR=/Users/Shared/ios${osver}_deps/iPhoneSimulator
           export SDK=iphoneos
           export PLATFORM=OS
