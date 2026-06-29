@@ -50,24 +50,30 @@ jobs:
         run: |
           mkdir build
           cd build
+          
+          # FIX: Explicitly set the developer directory for Xcode 16.2
+          export DEVELOPER_DIR=/Applications/Xcode_16.2.app/Contents/Developer
+          
           export DEPS_DIR=/Users/Shared/ios18.2_deps/iPhoneOS
           export SDK=iphoneos
           export PLATFORM=OS
           
-          # 1. Run CMake to generate the Xcode project
-          ../util/ci/build_ios.sh
+          # 1. Run CMake configuration
+          cmake .. -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos
           
-          # 2. PATCH: Force Manual Signing in the generated project
-          # This replaces the 'Automatic' signing style with 'Manual' in the project file
+          # 2. PATCH: Force Manual Signing
           sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle = Manual;/g' luanti.xcodeproj/project.pbxproj
           
-          # 3. Build with forced manual override
+          # 3. Build with explicit overrides
           xcodebuild -project luanti.xcodeproj -target luanti -configuration Release -sdk iphoneos \
+            DEVELOPER_DIR=/Applications/Xcode_16.2.app/Contents/Developer \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
             DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER=""
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            -allowProvisioningUpdates
 
       - name: Package .ipa
         run: |
