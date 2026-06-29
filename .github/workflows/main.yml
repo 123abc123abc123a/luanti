@@ -29,75 +29,55 @@ on:
 
 jobs:
   build-ios-device:
-    strategy:
-      matrix:
-        osver: [18.2]
-        xcodever: [16.2]
     runs-on: macos-15
     steps:
-      - name: Checkout iOS PR Source Code
+      - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
           repository: luanti-org/luanti
           ref: refs/pull/15451/head
 
-      - name: Prepare environment
+      - name: Install dependencies
         run: |
-          echo "REPDIR=$(pwd)" >> $GITHUB_ENV
-          echo "osver=${{matrix.osver}}" >> $GITHUB_ENV
-          echo "xcodever=${{matrix.xcodever}}" >> $GITHUB_ENV
-
-      - name: Install dependencies for Hardware
-        run: |
-          # Patch common setup and build scripts to target iPhoneOS
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/common.sh
           sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/common.sh
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/build_ios.sh
           sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/build_ios.sh
-          
           source ./util/ci/common.sh
-          install_ios_deps $osver
+          install_ios_deps 18.2
 
       - name: Build for iPhone Hardware
         run: |
           mkdir build
           cd build
-          
-          export DEPS_DIR=/Users/Shared/ios${osver}_deps/iPhoneOS
+          export DEPS_DIR=/Users/Shared/ios18.2_deps/iPhoneOS
           export SDK=iphoneos
           export PLATFORM=OS
           
-          # Force Xcode into Manual signing mode with empty identities
-          # to bypass the "requires a development team" check
-          ../util/ci/build_ios.sh \
-            CODE_SIGN_STYLE=Manual \
+          # 1. Run CMake to generate the Xcode project
+          ../util/ci/build_ios.sh
+          
+          # 2. PATCH: Force Manual Signing in the generated project
+          # This replaces the 'Automatic' signing style with 'Manual' in the project file
+          sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle = Manual;/g' luanti.xcodeproj/project.pbxproj
+          
+          # 3. Build with forced manual override
+          xcodebuild -project luanti.xcodeproj -target luanti -configuration Release -sdk iphoneos \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            -allowProvisioningUpdates
+            PROVISIONING_PROFILE_SPECIFIER=""
 
-      - name: Package Application Bundle into .ipa
+      - name: Package .ipa
         run: |
           mkdir -p ipa_release/Payload
-          
-          # Find the generated app bundle (luanti.app)
           APP_PATH=$(find build -name "*.app" -type d | head -n 1)
-          
-          if [ -z "$APP_PATH" ]; then
-            echo "::error::Could not find compiled .app bundle!"
-            exit 1
-          fi
-          
           cp -R "$APP_PATH" ipa_release/Payload/
           cd ipa_release
           zip -r ../Luanti_Device_Unsigned.ipa Payload/
-          cd ..
           
-          echo "Successfully packaged Luanti_Device_Unsigned.ipa"
-
-      - name: Upload IPA Artifact
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Luanti-iOS-Device-Build
