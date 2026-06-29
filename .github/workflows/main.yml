@@ -14,18 +14,6 @@ on:
       - 'cmake/Modules/**'
       - 'po/**.po'
       - '.github/workflows/ios.yml'
-  pull_request:
-    paths:
-      - 'lib/**.[ch]'
-      - 'lib/**.cpp'
-      - 'src/**.[ch]'
-      - 'src/**.cpp'
-      - 'irr/**.[ch]'
-      - 'irr/**.cpp'
-      - '**/CMakeLists.txt'
-      - 'cmake/Modules/**'
-      - 'po/**.po'
-      - '.github/workflows/ios.yml'
 
 jobs:
   build-ios-device:
@@ -39,10 +27,9 @@ jobs:
 
       - name: Install dependencies
         run: |
+          # Patch common setup scripts to target iPhoneOS
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/common.sh
           sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/common.sh
-          sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/build_ios.sh
-          sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/build_ios.sh
           source ./util/ci/common.sh
           install_ios_deps 18.2
 
@@ -51,17 +38,19 @@ jobs:
           mkdir build
           cd build
           
-          # FIX: Explicitly set the developer directory for Xcode 16.2
+          # Fix path to Xcode tools
           export DEVELOPER_DIR=/Applications/Xcode_16.2.app/Contents/Developer
           
+          # Ensure dependencies are picked up from the installed path
           export DEPS_DIR=/Users/Shared/ios18.2_deps/iPhoneOS
           export SDK=iphoneos
           export PLATFORM=OS
           
           # 1. Run CMake configuration
-          cmake .. -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos
+          cmake .. -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_PREFIX_PATH=$DEPS_DIR
           
-          # 2. PATCH: Force Manual Signing
+          # 2. PATCH: Force Manual Signing in the generated project
           sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle = Manual;/g' luanti.xcodeproj/project.pbxproj
           
           # 3. Build with explicit overrides
