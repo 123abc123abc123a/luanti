@@ -1,159 +1,86 @@
-name: iOS Sideload Build (.ipa for e-Sign/SideStore)
+name: iOS Sideload Build (.ipa)
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'lib/**.[ch]'
-      - 'lib/**.cpp'
-      - 'src/**.[ch]'
-      - 'src/**.cpp'
-      - 'irr/**.[ch]'
-      - 'irr/**.cpp'
-      - '**/CMakeLists.txt'
-      - 'cmake/Modules/**'
-      - 'po/**.po'
-      - '.github/workflows/ios.yml'
 
 env:
-  DEPS_DIR: /Users/Shared/ios18.2_deps/iPhoneOS
   DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
-  IOS_SDK_VERSION: "18.2"
-  FREETYPE_VERSION: "2.13.3"
+  IOS_OSVER: "18.2"
+  ARCH: iPhoneOS
+  # Where the official deps scripts install the built libraries:
+  INSTALL_DIR: /Users/runner/ios_install/iPhoneOS
 
 jobs:
   build-ios-device:
     runs-on: macos-15
     steps:
-      - name: Checkout Source Code
+      - name: Checkout Luanti (iOS PR)
         uses: actions/checkout@v4
         with:
           repository: luanti-org/luanti
           ref: refs/pull/15451/head
+          path: luanti
+
+      - name: Checkout iOS deps scripts
+        uses: actions/checkout@v4
+        with:
+          repository: luanti-org/luanti_ios_deps
+          path: ios_deps
 
       - name: Select Xcode 16.2
         run: |
           sudo xcode-select -s "$DEVELOPER_DIR"
           xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-path
 
-      - name: Install dependencies
-        run: |
-          sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/common.sh
-          sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/common.sh
-          sed -i '' 's/-arch x86_64/-arch arm64/g' util/ci/common.sh || true
-          source ./util/ci/common.sh
-          install_ios_deps "$IOS_SDK_VERSION"
+      # ANGLE + all deps take a long time; cache the install output.
+      - name: Cache iOS deps install
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.INSTALL_DIR }}
+          # Bump the version suffix to force a rebuild when scripts change.
+          key: ios-deps-${{ env.ARCH }}-${{ env.IOS_OSVER }}-v1
 
-      - name: Verify deps & locate SDL2
+      - name: Build iOS dependencies (incl. ANGLE)
+        if: steps.deps-cache.outputs.cache-hit != 'true'
         run: |
-          if [ ! -d "$DEPS_DIR" ]; then
-            echo "ERROR: DEPS_DIR not found: $DEPS_DIR"; ls -la /Users/Shared/ || true; exit 1
-          fi
-          ls -R "$DEPS_DIR" | head -n 250
-          SDL2_CFG_DIR=$(dirname "$(find "$DEPS_DIR" \
-            \( -iname 'SDL2Config.cmake' -o -iname 'sdl2-config.cmake' \) -print -quit 2>/dev/null)")
-          if [ -z "$SDL2_CFG_DIR" ] || [ "$SDL2_CFG_DIR" = "." ]; then
-            echo "ERROR: SDL2 config not found under $DEPS_DIR."; exit 1
-          fi
-          echo "SDL2_CFG_DIR=$SDL2_CFG_DIR" >> "$GITHUB_ENV"
+          # depot_tools is needed by ANGLE's build (gclient/gn/ninja).
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          export PATH="$HOME/depot_tools:$PATH"
 
-      - name: Ensure Freetype for iOS
-        run: |
-          FT_LIB=$(find "$DEPS_DIR" -name 'libfreetype*.a' -print -quit 2>/dev/null)
-          if [ -z "$FT_LIB" ]; then
-            echo "Building Freetype for iphoneos/arm64..."
-            SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
-            WORK=$(mktemp -d); cd "$WORK"
-            curl -L -o freetype.tar.xz \
-              "https://download.savannah.gnu.org/releases/freetype/freetype-${FREETYPE_VERSION}.tar.xz"
-            tar xf freetype.tar.xz
-            cd "freetype-${FREETYPE_VERSION}"
-            mkdir build-ios && cd build-ios
-            cmake .. -G "Unix Makefiles" \
-              -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT="$SDKROOT" \
-              -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_INSTALL_PREFIX="$DEPS_DIR" \
-              -DBUILD_SHARED_LIBS=OFF -DFT_DISABLE_HARFBUZZ=ON -DFT_DISABLE_BROTLI=ON \
-              -DFT_DISABLE_BZIP2=ON -DFT_REQUIRE_PNG=OFF -DFT_REQUIRE_ZLIB=OFF \
-              -DCMAKE_BUILD_TYPE=Release
-            cmake --build . --config Release -j"$(sysctl -n hw.ncpu)"
-            cmake --install .
-            FT_LIB=$(find "$DEPS_DIR" -name 'libfreetype*.a' -print -quit 2>/dev/null)
-            [ -z "$FT_LIB" ] && { echo "ERROR: Freetype build failed."; exit 1; }
-          fi
-          if [ -d "$DEPS_DIR/include/freetype2" ]; then FT_INC="$DEPS_DIR/include/freetype2"; else FT_INC="$DEPS_DIR/include"; fi
-          echo "FT_LIB=$FT_LIB" >> "$GITHUB_ENV"
-          echo "FT_INC=$FT_INC" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/ios_deps_work" "$INSTALL_DIR"
+          cd ios_deps
+          chmod +x build.sh deps.sh angle.sh || true
 
-      - name: Patch out translations dependency (gettext disabled)
+          # build.sh <where_deps> <where_install> <arch> <osver> <step>
+          ./build.sh "$HOME/ios_deps_work" "$INSTALL_DIR" "$ARCH" "$IOS_OSVER" all
+
+      - name: Inspect installed deps
         run: |
-          grep -n "translations" src/CMakeLists.txt || echo "none"
-          sed -i '' '/add_dependencies(.*translations.*)/ s/^/# DISABLED (no gettext): /' src/CMakeLists.txt
-          grep -n "translations" src/CMakeLists.txt || true
+          echo "=== Install tree ==="
+          ls -R "$INSTALL_DIR" | head -n 300
+          echo "=== EGL header present? ==="
+          find "$INSTALL_DIR" -name "egl.h" -path "*EGL*" || echo "EGL/egl.h NOT FOUND"
+          echo "=== SDL2 config ==="
+          find "$INSTALL_DIR" \( -iname 'SDL2Config.cmake' -o -iname 'sdl2-config.cmake' \) || true
 
       - name: Configure (CMake)
         run: |
+          cd luanti
           mkdir build && cd build
+
+          DEPS="$INSTALL_DIR"
+          SDL2_CFG_DIR=$(dirname "$(find "$DEPS" \( -iname 'SDL2Config.cmake' -o -iname 'sdl2-config.cmake' \) -print -quit)")
+
           cmake .. -G Xcode \
-            -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos \
-            -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_PREFIX_PATH="$DEPS_DIR" \
-            -DSDL2_DIR="$SDL2_CFG_DIR" \
-            -DPNG_LIBRARY="$DEPS_DIR/lib/libpng.a" -DPNG_PNG_INCLUDE_DIR="$DEPS_DIR/include" \
-            -DJPEG_LIBRARY="$DEPS_DIR/lib/libjpeg.a" -DJPEG_INCLUDE_DIR="$DEPS_DIR/include" \
-            -DZSTD_LIBRARY="$DEPS_DIR/lib/libzstd.a" -DZSTD_INCLUDE_DIR="$DEPS_DIR/include" \
-            -DFREETYPE_LIBRARY="$FT_LIB" -DFREETYPE_INCLUDE_DIRS="$FT_INC" \
-            -DENABLE_SOUND=0 -DENABLE_CURL=0 -DENABLE_GETTEXT=0 \
-            -DBUILD_UNITTESTS=0 -DBUILD_BENCHMARKS=0
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_PREFIX_PATH="$DEPS" \
+            -DCMAKE_FIND_ROOT_PATH="$DEPS" \
+            -DSDL2_DIR="$SDL2_CFG_DIR"
 
       - name: Build for iPhone Hardware (unsigned)
         run: |
-          cd build
-          sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle = Manual;/g' luanti.xcodeproj/project.pbxproj
-          xcodebuild -project luanti.xcodeproj -list
-          xcodebuild \
-            -project luanti.xcodeproj -target luanti -configuration Release \
-            -sdk iphoneos -destination 'generic/platform=iOS' \
-            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGN_ENTITLEMENTS="" DEVELOPMENT_TEAM="" PROVISIONING_PROFILE_SPECIFIER=""
-
-      - name: Package sideload-ready .ipa
-        run: |
-          APP_PATH=$(find build -type d -name "*.app" ! -name "*.dSYM" | head -n 1)
-          if [ -z "$APP_PATH" ]; then
-            echo "ERROR: No .app bundle found."; find build -name "*.app*" -maxdepth 6 || true; exit 1
-          fi
-          echo "App: $APP_PATH"
-
-          # Sideload hardening: strip any leftover signature so e-Sign/SideStore
-          # can cleanly re-sign with the user's certificate.
-          rm -rf "$APP_PATH/_CodeSignature" || true
-          rm -f  "$APP_PATH/embedded.mobileprovision" || true
-
-          # Show Info.plist essentials sideloaders rely on.
-          PLIST="$APP_PATH/Info.plist"
-          echo "=== Info.plist key values ==="
-          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST" 2>/dev/null || echo "no CFBundleIdentifier"
-          /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$PLIST" 2>/dev/null || echo "no CFBundleExecutable"
-          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion"    "$PLIST" 2>/dev/null || echo "no CFBundleVersion"
-          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion"   "$PLIST" 2>/dev/null || echo "no MinimumOSVersion"
-
-          # Verify the binary is arm64 (device), not x86_64 (simulator).
-          BIN_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$PLIST" 2>/dev/null || echo "luanti")
-          echo "=== Binary architecture ==="
-          file "$APP_PATH/$BIN_NAME" || true
-          lipo -info "$APP_PATH/$BIN_NAME" 2>/dev/null || true
-
-          # Build the IPA with the required Payload/ layout.
-          mkdir -p ipa_release/Payload
-          cp -R "$APP_PATH" ipa_release/Payload/
-          cd ipa_release
-          zip -r ../Luanti_Sideload.ipa Payload/ -x "*.DS_Store"
-          echo "=== IPA contents ==="
-          unzip -l ../Luanti_Sideload.ipa | head -n 40
-
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Luanti-iOS-Sideload
-          path: Luanti_Sideload.ipa
-          retention-days: 5
+          cd luanti/build
+          sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle =
