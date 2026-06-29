@@ -1,6 +1,5 @@
 name: iOS Device Build (.ipa)
 
-# build on manual trigger, c/cpp changes, or workflow changes
 on:
   workflow_dispatch:
   push:
@@ -50,7 +49,7 @@ jobs:
 
       - name: Install deps
         run: |
-          # FIX: Intercept and force the toolchain script to compile dependencies for iPhoneOS instead of the Simulator
+          # Patch common setup and build scripts to target iPhoneOS
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/common.sh
           sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/common.sh
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/build_ios.sh
@@ -64,32 +63,24 @@ jobs:
           mkdir build
           cd build
           
-          # Explicitly target the newly generated physical hardware dependencies directory
           export DEPS_DIR=/Users/Shared/ios${osver}_deps/iPhoneOS
           export SDK=iphoneos
           export PLATFORM=OS
           
-          ../util/ci/build_ios.sh
+          # Execute the build, disabling code signing via command-line arguments
+          ../util/ci/build_ios.sh CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
 
       - name: Package Application Bundle into .ipa
         run: |
-          # Create the strict directory layout required by iOS sideloading clients
           mkdir -p ipa_release/Payload
-          
-          # Dynamic search to locate the compiled bundle inside the build tree
           APP_PATH=$(find build -name "*.app" -type d | head -n 1)
           
           if [ -z "$APP_PATH" ]; then
-            echo "::error::Could not find any compiled .app bundle in the build directory!"
+            echo "::error::Could not find any compiled .app bundle!"
             exit 1
           fi
           
-          echo "Found compiled binary at: $APP_PATH"
-          
-          # Copy the compiled application tree into the Payload environment
           cp -R "$APP_PATH" ipa_release/Payload/
-          
-          # Zip the structure into a deployment-ready container file
           cd ipa_release
           zip -r ../Luanti_Device_Unsigned.ipa Payload/
           cd ..
