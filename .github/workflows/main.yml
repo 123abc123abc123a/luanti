@@ -1,6 +1,6 @@
 name: iOS Device Build (.ipa)
 
-# build on c/cpp changes or workflow changes
+# build on manual trigger, c/cpp changes, or workflow changes
 on:
   workflow_dispatch:
   push:
@@ -36,7 +36,12 @@ jobs:
         xcodever: [16.2]
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      # FIX: Targets the active pull request repository layout containing the iOS toolchains
+      - name: Checkout iOS PR Source Code
+        uses: actions/checkout@v4
+        with:
+          repository: luanti-org/luanti
+          ref: refs/pull/15451/head
 
       - name: Prepare environment
         run: |
@@ -47,7 +52,7 @@ jobs:
       - name: Install deps
         run: |
           source ./util/ci/common.sh
-          # Fetches core toolchains and packages required for compilation
+          # Successfully executes now that the PR shell files are present
           install_ios_deps $osver
 
       - name: Build for iPhone Hardware
