@@ -15,6 +15,10 @@ on:
       - 'po/**.po'
       - '.github/workflows/ios.yml'
 
+env:
+  DEPS_DIR: /Users/Shared/ios18.2_deps/iPhoneOS
+  DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
+
 jobs:
   build-ios-device:
     runs-on: macos-15
@@ -25,55 +29,111 @@ jobs:
           repository: luanti-org/luanti
           ref: refs/pull/15451/head
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer
+      - name: Select Xcode 16.2
+        run: |
+          sudo xcode-select -s "$DEVELOPER_DIR"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Inspect dependency script (SDL handling)
+        run: |
+          echo "=== install_ios_deps definition ==="
+          grep -n "install_ios_deps" util/ci/common.sh || true
+          echo "=== Any SDL references in common.sh ==="
+          grep -n -i "sdl" util/ci/common.sh || echo "No SDL reference found in common.sh"
+          echo "=== iphonesimulator / iPhoneSimulator references (before patch) ==="
+          grep -n -i "iphonesimulator" util/ci/common.sh || echo "none"
 
       - name: Install dependencies
         run: |
+          # Flip the simulator-oriented script to target device.
+          # NOTE: blanket sed is fragile; the inspect step above lets you
+          # confirm nothing critical (arch flags, variable names) was broken.
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/common.sh
           sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/common.sh
+
+          # Some scripts also hardcode simulator arch; force device arm64 if so.
+          # (Harmless if the pattern is absent.)
+          sed -i '' 's/-arch x86_64/-arch arm64/g' util/ci/common.sh || true
+
           source ./util/ci/common.sh
           install_ios_deps 18.2
 
-      - name: Build for iPhone Hardware
+      - name: Verify dependencies (fail early if SDL2 missing)
         run: |
-          mkdir build
-          cd build
-
-          export DEVELOPER_DIR=/Applications/Xcode_16.2.app/Contents/Developer
-          export DEPS_DIR=/Users/Shared/ios18.2_deps/iPhoneOS
-
-          # Sanity check that the deps actually exist
+          echo "=== Listing deps dir: $DEPS_DIR ==="
           if [ ! -d "$DEPS_DIR" ]; then
             echo "ERROR: DEPS_DIR not found: $DEPS_DIR"
             ls -la /Users/Shared/ || true
             exit 1
           fi
+          ls -R "$DEPS_DIR" | head -n 200
 
-          # 1. Run CMake with explicit paths to pre-compiled libraries
+          echo "=== Searching for SDL2 artifacts ==="
+          find /Users/Shared -iname "*SDL2*" 2>/dev/null || true
+
+          # Locate the SDL2 CMake config so we can pass it explicitly.
+          SDL2_CFG_DIR=$(dirname "$(find "$DEPS_DIR" \
+            \( -iname 'SDL2Config.cmake' -o -iname 'sdl2-config.cmake' \) \
+            -print -quit 2>/dev/null)")
+
+          if [ -z "$SDL2_CFG_DIR" ] || [ "$SDL2_CFG_DIR" = "." ]; then
+            echo "WARNING: No SDL2 CMake config found under $DEPS_DIR."
+            echo "Searching the whole deps tree..."
+            SDL2_CFG_DIR=$(dirname "$(find /Users/Shared \
+              \( -iname 'SDL2Config.cmake' -o -iname 'sdl2-config.cmake' \) \
+              -print -quit 2>/dev/null)")
+          fi
+
+          if [ -z "$SDL2_CFG_DIR" ] || [ "$SDL2_CFG_DIR" = "." ]; then
+            echo "ERROR: SDL2 was not built/installed for iphoneos."
+            echo "       'install_ios_deps' likely failed or the sed edits"
+            echo "       broke its SDL2 build step. Check the inspect step output."
+            exit 1
+          fi
+
+          echo "Found SDL2 config dir: $SDL2_CFG_DIR"
+          echo "SDL2_CFG_DIR=$SDL2_CFG_DIR" >> "$GITHUB_ENV"
+
+      - name: Configure (CMake)
+        run: |
+          mkdir build
+          cd build
+
           cmake .. -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_PREFIX_PATH="$DEPS_DIR" \
+            -DSDL2_DIR="$SDL2_CFG_DIR" \
             -DPNG_LIBRARY="$DEPS_DIR/lib/libpng.a" \
             -DPNG_PNG_INCLUDE_DIR="$DEPS_DIR/include" \
             -DJPEG_LIBRARY="$DEPS_DIR/lib/libjpeg.a" \
             -DJPEG_INCLUDE_DIR="$DEPS_DIR/include" \
             -DZSTD_LIBRARY="$DEPS_DIR/lib/libzstd.a" \
-            -DZSTD_INCLUDE_DIR="$DEPS_DIR/include"
+            -DZSTD_INCLUDE_DIR="$DEPS_DIR/include" \
+            -DBUILD_UNITTESTS=FALSE \
+            -DBUILD_BENCHMARKS=FALSE
 
-          # 2. PATCH: Force Manual Signing in the generated project
-          sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle = Manual;/g' luanti.xcodeproj/project.pbxproj
+      - name: Build for iPhone Hardware (unsigned)
+        run: |
+          cd build
 
-          # 3. Build with explicit overrides to bypass signing.
-          #    Remove -allowProvisioningUpdates (it requires a team/account and
-          #    conflicts with disabling code signing).
+          # Force Manual signing style in the generated project.
+          sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle = Manual;/g' \
+            luanti.xcodeproj/project.pbxproj
+
+          # Confirm the target name actually exists.
+          echo "=== Available targets ==="
+          xcodebuild -project luanti.xcodeproj -list
+
+          # Build with signing fully disabled (no -allowProvisioningUpdates!).
           xcodebuild \
             -project luanti.xcodeproj \
             -target luanti \
             -configuration Release \
             -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
@@ -84,16 +144,23 @@ jobs:
       - name: Package .ipa
         run: |
           mkdir -p ipa_release/Payload
-          APP_PATH=$(find build -name "*.app" -type d | head -n 1)
+
+          # Match only real .app bundles, not .app.dSYM.
+          APP_PATH=$(find build -type d -name "*.app" ! -name "*.dSYM" | head -n 1)
           if [ -z "$APP_PATH" ]; then
             echo "ERROR: No .app bundle found under build/"
-            find build -name "*.app" -o -name "*.app.dSYM" || true
+            echo "=== Anything app-like that was produced ==="
+            find build -name "*.app*" -maxdepth 6 || true
             exit 1
           fi
           echo "Found app at: $APP_PATH"
+
           cp -R "$APP_PATH" ipa_release/Payload/
           cd ipa_release
           zip -r ../Luanti_Device_Unsigned.ipa Payload/
+
+          echo "=== IPA contents ==="
+          unzip -l ../Luanti_Device_Unsigned.ipa | head -n 40
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
