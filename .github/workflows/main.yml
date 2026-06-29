@@ -49,7 +49,6 @@ jobs:
 
       - name: Install deps
         run: |
-          # Patch scripts to force iPhoneOS dependency compilation
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/common.sh
           sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/common.sh
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/build_ios.sh
@@ -63,25 +62,23 @@ jobs:
           mkdir build
           cd build
           
-          # Point to the freshly compiled hardware dependencies
           export DEPS_DIR=/Users/Shared/ios${osver}_deps/iPhoneOS
           export SDK=iphoneos
           export PLATFORM=OS
           
-          # Execute build with explicit signing overrides to prevent "Development Team" error
+          # Force build without signing by overriding all identity and team requirements
           ../util/ci/build_ios.sh \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
-            PROVISIONING_PROFILE_SPECIFIER="" \
+            DEVELOPMENT_TEAM="" \
             -allowProvisioningUpdates
 
       - name: Package Application Bundle into .ipa
         run: |
           mkdir -p ipa_release/Payload
-          
-          # Find the generated app bundle
           APP_PATH=$(find build -name "*.app" -type d | head -n 1)
+          
           if [ -z "$APP_PATH" ]; then
             echo "::error::Could not find compiled .app bundle!"
             exit 1
