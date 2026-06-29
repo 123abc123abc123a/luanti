@@ -55,8 +55,9 @@ jobs:
 
       - name: Build for iPhone Hardware
         run: |
-          # FIX: Forcefully patch the upstream build automation script to output an iPhone device binary
+          # FIX: Patch both lowercase and CamelCase instances to fully align SDK paths
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/build_ios.sh
+          sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/build_ios.sh
           
           mkdir build
           cd build
