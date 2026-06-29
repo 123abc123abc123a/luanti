@@ -18,6 +18,8 @@ on:
 env:
   DEPS_DIR: /Users/Shared/ios18.2_deps/iPhoneOS
   DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
+  IOS_SDK_VERSION: "18.2"
+  FREETYPE_VERSION: "2.13.3"
 
 jobs:
   build-ios-device:
@@ -35,65 +37,100 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
 
-      - name: Inspect dependency script (SDL handling)
+      - name: Inspect dependency script
         run: |
           echo "=== install_ios_deps definition ==="
           grep -n "install_ios_deps" util/ci/common.sh || true
-          echo "=== Any SDL references in common.sh ==="
-          grep -n -i "sdl" util/ci/common.sh || echo "No SDL reference found in common.sh"
-          echo "=== iphonesimulator / iPhoneSimulator references (before patch) ==="
+          echo "=== SDL references ==="
+          grep -n -i "sdl" util/ci/common.sh || echo "none"
+          echo "=== Freetype references ==="
+          grep -n -i "freetype" util/ci/common.sh || echo "none"
+          echo "=== iphonesimulator references (before patch) ==="
           grep -n -i "iphonesimulator" util/ci/common.sh || echo "none"
 
       - name: Install dependencies
         run: |
-          # Flip the simulator-oriented script to target device.
-          # NOTE: blanket sed is fragile; the inspect step above lets you
-          # confirm nothing critical (arch flags, variable names) was broken.
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/common.sh
           sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/common.sh
-
-          # Some scripts also hardcode simulator arch; force device arm64 if so.
-          # (Harmless if the pattern is absent.)
           sed -i '' 's/-arch x86_64/-arch arm64/g' util/ci/common.sh || true
 
           source ./util/ci/common.sh
-          install_ios_deps 18.2
+          install_ios_deps "$IOS_SDK_VERSION"
 
-      - name: Verify dependencies (fail early if SDL2 missing)
+      - name: Verify deps & locate SDL2
         run: |
-          echo "=== Listing deps dir: $DEPS_DIR ==="
           if [ ! -d "$DEPS_DIR" ]; then
             echo "ERROR: DEPS_DIR not found: $DEPS_DIR"
             ls -la /Users/Shared/ || true
             exit 1
           fi
-          ls -R "$DEPS_DIR" | head -n 200
+          echo "=== Deps tree ==="
+          ls -R "$DEPS_DIR" | head -n 250
 
-          echo "=== Searching for SDL2 artifacts ==="
-          find /Users/Shared -iname "*SDL2*" 2>/dev/null || true
-
-          # Locate the SDL2 CMake config so we can pass it explicitly.
           SDL2_CFG_DIR=$(dirname "$(find "$DEPS_DIR" \
             \( -iname 'SDL2Config.cmake' -o -iname 'sdl2-config.cmake' \) \
             -print -quit 2>/dev/null)")
-
           if [ -z "$SDL2_CFG_DIR" ] || [ "$SDL2_CFG_DIR" = "." ]; then
-            echo "WARNING: No SDL2 CMake config found under $DEPS_DIR."
-            echo "Searching the whole deps tree..."
-            SDL2_CFG_DIR=$(dirname "$(find /Users/Shared \
-              \( -iname 'SDL2Config.cmake' -o -iname 'sdl2-config.cmake' \) \
-              -print -quit 2>/dev/null)")
-          fi
-
-          if [ -z "$SDL2_CFG_DIR" ] || [ "$SDL2_CFG_DIR" = "." ]; then
-            echo "ERROR: SDL2 was not built/installed for iphoneos."
-            echo "       'install_ios_deps' likely failed or the sed edits"
-            echo "       broke its SDL2 build step. Check the inspect step output."
+            echo "ERROR: SDL2 config not found under $DEPS_DIR."
             exit 1
           fi
-
-          echo "Found SDL2 config dir: $SDL2_CFG_DIR"
           echo "SDL2_CFG_DIR=$SDL2_CFG_DIR" >> "$GITHUB_ENV"
+          echo "Found SDL2 config dir: $SDL2_CFG_DIR"
+
+      - name: Ensure Freetype for iOS
+        run: |
+          # 1. Check if install_ios_deps already produced a Freetype static lib.
+          FT_LIB=$(find "$DEPS_DIR" -name 'libfreetype*.a' -print -quit 2>/dev/null)
+
+          if [ -n "$FT_LIB" ]; then
+            echo "Freetype already present: $FT_LIB"
+          else
+            echo "Freetype not found for iOS — building it for iphoneos/arm64..."
+
+            SDKROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+            WORK=$(mktemp -d)
+            cd "$WORK"
+
+            curl -L -o freetype.tar.xz \
+              "https://download.savannah.gnu.org/releases/freetype/freetype-${FREETYPE_VERSION}.tar.xz"
+            tar xf freetype.tar.xz
+            cd "freetype-${FREETYPE_VERSION}"
+
+            mkdir build-ios && cd build-ios
+            cmake .. -G "Unix Makefiles" \
+              -DCMAKE_SYSTEM_NAME=iOS \
+              -DCMAKE_OSX_SYSROOT="$SDKROOT" \
+              -DCMAKE_OSX_ARCHITECTURES=arm64 \
+              -DCMAKE_INSTALL_PREFIX="$DEPS_DIR" \
+              -DBUILD_SHARED_LIBS=OFF \
+              -DFT_DISABLE_HARFBUZZ=ON \
+              -DFT_DISABLE_BROTLI=ON \
+              -DFT_DISABLE_BZIP2=ON \
+              -DFT_REQUIRE_PNG=OFF \
+              -DFT_REQUIRE_ZLIB=OFF \
+              -DCMAKE_BUILD_TYPE=Release
+            cmake --build . --config Release -j"$(sysctl -n hw.ncpu)"
+            cmake --install .
+
+            FT_LIB=$(find "$DEPS_DIR" -name 'libfreetype*.a' -print -quit 2>/dev/null)
+            if [ -z "$FT_LIB" ]; then
+              echo "ERROR: Freetype build/install failed."
+              exit 1
+            fi
+            echo "Built Freetype: $FT_LIB"
+          fi
+
+          # Determine include dir (standard layout is include/freetype2).
+          if [ -d "$DEPS_DIR/include/freetype2" ]; then
+            FT_INC="$DEPS_DIR/include/freetype2"
+          else
+            FT_INC="$DEPS_DIR/include"
+          fi
+
+          echo "FT_LIB=$FT_LIB" >> "$GITHUB_ENV"
+          echo "FT_INC=$FT_INC" >> "$GITHUB_ENV"
+          echo "Freetype lib: $FT_LIB"
+          echo "Freetype include: $FT_INC"
 
       - name: Configure (CMake)
         run: |
@@ -112,6 +149,8 @@ jobs:
             -DJPEG_INCLUDE_DIR="$DEPS_DIR/include" \
             -DZSTD_LIBRARY="$DEPS_DIR/lib/libzstd.a" \
             -DZSTD_INCLUDE_DIR="$DEPS_DIR/include" \
+            -DFREETYPE_LIBRARY="$FT_LIB" \
+            -DFREETYPE_INCLUDE_DIRS="$FT_INC" \
             -DENABLE_SOUND=0 \
             -DENABLE_CURL=0 \
             -DENABLE_GETTEXT=0 \
@@ -122,15 +161,12 @@ jobs:
         run: |
           cd build
 
-          # Force Manual signing style in the generated project.
           sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle = Manual;/g' \
             luanti.xcodeproj/project.pbxproj
 
-          # Confirm the target name actually exists.
           echo "=== Available targets ==="
           xcodebuild -project luanti.xcodeproj -list
 
-          # Build with signing fully disabled (no -allowProvisioningUpdates!).
           xcodebuild \
             -project luanti.xcodeproj \
             -target luanti \
@@ -147,21 +183,16 @@ jobs:
       - name: Package .ipa
         run: |
           mkdir -p ipa_release/Payload
-
-          # Match only real .app bundles, not .app.dSYM.
           APP_PATH=$(find build -type d -name "*.app" ! -name "*.dSYM" | head -n 1)
           if [ -z "$APP_PATH" ]; then
             echo "ERROR: No .app bundle found under build/"
-            echo "=== Anything app-like that was produced ==="
             find build -name "*.app*" -maxdepth 6 || true
             exit 1
           fi
           echo "Found app at: $APP_PATH"
-
           cp -R "$APP_PATH" ipa_release/Payload/
           cd ipa_release
           zip -r ../Luanti_Device_Unsigned.ipa Payload/
-
           echo "=== IPA contents ==="
           unzip -l ../Luanti_Device_Unsigned.ipa | head -n 40
 
