@@ -1,18 +1,20 @@
-name: iOS Sideload Build (.ipa)
+name: iOS Sideload Build (.ipa for e-Sign/SideStore)
 
 on:
   workflow_dispatch:
 
 env:
   DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
-  IOS_OSVER: "18.2"
+  IOS_OSVER: "18.2"            # If "Show available iOS SDKs" shows a different
+                               # version, change this to match exactly.
   ARCH: iPhoneOS
-  # Where the official deps scripts install the built libraries:
+  DEPS_WORK: /Users/runner/ios_deps_work
   INSTALL_DIR: /Users/runner/ios_install/iPhoneOS
 
 jobs:
   build-ios-device:
     runs-on: macos-15
+    timeout-minutes: 300
     steps:
       - name: Checkout Luanti (iOS PR)
         uses: actions/checkout@v4
@@ -32,37 +34,61 @@ jobs:
           sudo xcode-select -s "$DEVELOPER_DIR"
           xcodebuild -version
 
-      # ANGLE + all deps take a long time; cache the install output.
+      - name: Show available iOS SDKs (diagnostic)
+        run: |
+          echo "=== xcodebuild -showsdks ==="
+          xcodebuild -showsdks || true
+          echo "=== iPhoneOS platform SDK directory ==="
+          ls -la "$DEVELOPER_DIR/Platforms/iPhoneOS.platform/Developer/SDKs/" || true
+          echo "=== xcrun iphoneos SDK ==="
+          echo "version: $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "path:    $(xcrun --sdk iphoneos --show-sdk-path)"
+
+      # --- Caching to avoid the very slow ANGLE download/sync on retries ---
+      - name: Cache ANGLE / deps work dir
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DEPS_WORK }}
+          key: ios-deps-work-${{ env.ARCH }}-${{ env.IOS_OSVER }}-v1
+
       - name: Cache iOS deps install
         id: deps-cache
         uses: actions/cache@v4
         with:
           path: ${{ env.INSTALL_DIR }}
-          # Bump the version suffix to force a rebuild when scripts change.
-          key: ios-deps-${{ env.ARCH }}-${{ env.IOS_OSVER }}-v1
+          key: ios-deps-install-${{ env.ARCH }}-${{ env.IOS_OSVER }}-v1
 
       - name: Build iOS dependencies (incl. ANGLE)
         if: steps.deps-cache.outputs.cache-hit != 'true'
         run: |
-          # depot_tools is needed by ANGLE's build (gclient/gn/ninja).
-          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          set -e
+
+          # depot_tools is required by ANGLE's gclient/gn/ninja build.
+          if [ ! -d "$HOME/depot_tools" ]; then
+            git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          fi
           export PATH="$HOME/depot_tools:$PATH"
 
-          mkdir -p "$HOME/ios_deps_work" "$INSTALL_DIR"
+          mkdir -p "$DEPS_WORK" "$INSTALL_DIR"
+
           cd ios_deps
           chmod +x build.sh deps.sh angle.sh || true
 
           # build.sh <where_deps> <where_install> <arch> <osver> <step>
-          ./build.sh "$HOME/ios_deps_work" "$INSTALL_DIR" "$ARCH" "$IOS_OSVER" all
+          ./build.sh "$DEPS_WORK" "$INSTALL_DIR" "$ARCH" "$IOS_OSVER" all
 
       - name: Inspect installed deps
         run: |
-          echo "=== Install tree ==="
+          echo "=== Install tree (top) ==="
           ls -R "$INSTALL_DIR" | head -n 300
-          echo "=== EGL header present? ==="
+          echo "=== EGL header present? (ANGLE) ==="
           find "$INSTALL_DIR" -name "egl.h" -path "*EGL*" || echo "EGL/egl.h NOT FOUND"
+          echo "=== GLES headers? ==="
+          find "$INSTALL_DIR" -path "*GLES*" -name "*.h" | head -n 10 || true
           echo "=== SDL2 config ==="
           find "$INSTALL_DIR" \( -iname 'SDL2Config.cmake' -o -iname 'sdl2-config.cmake' \) || true
+          echo "=== Freetype ==="
+          find "$INSTALL_DIR" -name 'libfreetype*' || true
 
       - name: Configure (CMake)
         run: |
@@ -71,6 +97,7 @@ jobs:
 
           DEPS="$INSTALL_DIR"
           SDL2_CFG_DIR=$(dirname "$(find "$DEPS" \( -iname 'SDL2Config.cmake' -o -iname 'sdl2-config.cmake' \) -print -quit)")
+          echo "SDL2_DIR -> $SDL2_CFG_DIR"
 
           cmake .. -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS \
@@ -78,9 +105,91 @@ jobs:
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_PREFIX_PATH="$DEPS" \
             -DCMAKE_FIND_ROOT_PATH="$DEPS" \
-            -DSDL2_DIR="$SDL2_CFG_DIR"
+            -DSDL2_DIR="$SDL2_CFG_DIR" \
+            -DBUILD_UNITTESTS=0 \
+            -DBUILD_BENCHMARKS=0
 
       - name: Build for iPhone Hardware (unsigned)
         run: |
           cd luanti/build
-          sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle =
+
+          # Force manual signing style so the unsigned build doesn't try to
+          # auto-provision; e-Sign/SideStore will re-sign on install.
+          sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle = Manual;/g' \
+            luanti.xcodeproj/project.pbxproj
+
+          echo "=== Targets ==="
+          xcodebuild -project luanti.xcodeproj -list
+
+          set -o pipefail
+          xcodebuild \
+            -project luanti.xcodeproj \
+            -target luanti \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            2>&1 | tee xcodebuild_full.log || BUILD_FAILED=1
+
+          echo "================ ERROR SUMMARY ================"
+          grep -n -i -E "error:|fatal error|undefined symbol|symbol\(s\) not found|ld: " \
+            xcodebuild_full.log | head -n 60 || echo "No explicit error lines matched."
+          echo "================ LAST 60 LINES ================"
+          tail -n 60 xcodebuild_full.log
+
+          if [ "${BUILD_FAILED:-0}" = "1" ]; then exit 65; fi
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: luanti/build/xcodebuild_full.log
+          retention-days: 5
+
+      - name: Package sideload-ready .ipa
+        run: |
+          cd luanti
+          APP_PATH=$(find build -type d -name "*.app" ! -name "*.dSYM" | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: No .app bundle found."
+            find build -name "*.app*" -maxdepth 6 || true
+            exit 1
+          fi
+          echo "App: $APP_PATH"
+
+          # Sideload hardening: remove any stale signature so e-Sign/SideStore
+          # can cleanly re-sign with your certificate.
+          rm -rf "$APP_PATH/_CodeSignature" || true
+          rm -f  "$APP_PATH/embedded.mobileprovision" || true
+
+          PLIST="$APP_PATH/Info.plist"
+          echo "=== Info.plist essentials (for sideloading) ==="
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$PLIST" 2>/dev/null || echo "no CFBundleIdentifier"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$PLIST" 2>/dev/null || echo "no CFBundleExecutable"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion"    "$PLIST" 2>/dev/null || echo "no CFBundleVersion"
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion"   "$PLIST" 2>/dev/null || echo "no MinimumOSVersion"
+
+          BIN_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$PLIST" 2>/dev/null || echo "luanti")
+          echo "=== Binary architecture (must be arm64) ==="
+          file "$APP_PATH/$BIN_NAME" || true
+          lipo -info "$APP_PATH/$BIN_NAME" 2>/dev/null || true
+
+          mkdir -p ipa_release/Payload
+          cp -R "$APP_PATH" ipa_release/Payload/
+          cd ipa_release
+          zip -r ../../Luanti_Sideload.ipa Payload/ -x "*.DS_Store"
+          echo "=== IPA contents ==="
+          unzip -l ../../Luanti_Sideload.ipa | head -n 40
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Luanti-iOS-Sideload
+          path: Luanti_Sideload.ipa
+          retention-days: 5
