@@ -112,8 +112,11 @@ jobs:
             -DJPEG_INCLUDE_DIR="$DEPS_DIR/include" \
             -DZSTD_LIBRARY="$DEPS_DIR/lib/libzstd.a" \
             -DZSTD_INCLUDE_DIR="$DEPS_DIR/include" \
-            -DBUILD_UNITTESTS=FALSE \
-            -DBUILD_BENCHMARKS=FALSE
+            -DENABLE_SOUND=0 \
+            -DENABLE_CURL=0 \
+            -DENABLE_GETTEXT=0 \
+            -DBUILD_UNITTESTS=0 \
+            -DBUILD_BENCHMARKS=0
 
       - name: Build for iPhone Hardware (unsigned)
         run: |
