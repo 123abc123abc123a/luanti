@@ -47,8 +47,9 @@ jobs:
           echo "osver=${{matrix.osver}}" >> $GITHUB_ENV
           echo "xcodever=${{matrix.xcodever}}" >> $GITHUB_ENV
 
-      - name: Install deps
+      - name: Install dependencies for Hardware
         run: |
+          # Patch common setup and build scripts to target iPhoneOS
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/common.sh
           sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/common.sh
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/build_ios.sh
@@ -66,17 +67,22 @@ jobs:
           export SDK=iphoneos
           export PLATFORM=OS
           
-          # Force build without signing by overriding all identity and team requirements
+          # Force Xcode into Manual signing mode with empty identities
+          # to bypass the "requires a development team" check
           ../util/ci/build_ios.sh \
+            CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
             -allowProvisioningUpdates
 
       - name: Package Application Bundle into .ipa
         run: |
           mkdir -p ipa_release/Payload
+          
+          # Find the generated app bundle (luanti.app)
           APP_PATH=$(find build -name "*.app" -type d | head -n 1)
           
           if [ -z "$APP_PATH" ]; then
