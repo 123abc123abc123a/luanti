@@ -1,0 +1,94 @@
+name: iOS Device Build (.ipa)
+
+# build on c/cpp changes or workflow changes
+on:
+  push:
+    paths:
+      - 'lib/**.[ch]'
+      - 'lib/**.cpp'
+      - 'src/**.[ch]'
+      - 'src/**.cpp'
+      - 'irr/**.[ch]'
+      - 'irr/**.cpp'
+      - '**/CMakeLists.txt'
+      - 'cmake/Modules/**'
+      - 'po/**.po'
+      - '.github/workflows/ios.yml'
+  pull_request:
+    paths:
+      - 'lib/**.[ch]'
+      - 'lib/**.cpp'
+      - 'src/**.[ch]'
+      - 'src/**.cpp'
+      - 'irr/**.[ch]'
+      - 'irr/**.cpp'
+      - '**/CMakeLists.txt'
+      - 'cmake/Modules/**'
+      - 'po/**.po'
+      - '.github/workflows/ios.yml'
+
+jobs:
+  build-ios-device:
+    strategy:
+      matrix:
+        osver: [18.2]
+        xcodever: [16.2]
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare environment
+        run: |
+          echo "REPDIR=$(pwd)" >> $GITHUB_ENV
+          echo "osver=${{matrix.osver}}" >> $GITHUB_ENV
+          echo "xcodever=${{matrix.xcodever}}" >> $GITHUB_ENV
+
+      - name: Install deps
+        run: |
+          source ./util/ci/common.sh
+          # Fetches core toolchains and packages required for compilation
+          install_ios_deps $osver
+
+      - name: Build for iPhone Hardware
+        run: |
+          mkdir build
+          cd build
+          
+          # Force the environment to target the physical device SDK (iphoneos) instead of the simulator
+          export DEPS_DIR=/Users/Shared/ios${osver}_deps/iPhoneOS
+          export SDK=iphoneos
+          export PLATFORM=OS
+          
+          ../util/ci/build_ios.sh
+
+      - name: Package Application Bundle into .ipa
+        run: |
+          # Create the strict directory layout required by iOS sideloading clients
+          mkdir -p ipa_release/Payload
+          
+          # Dynamic search to locate the compiled bundle inside the build tree
+          APP_PATH=$(find build -name "*.app" -type d | head -n 1)
+          
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::Could not find any compiled .app bundle in the build directory!"
+            exit 1
+          fi
+          
+          echo "Found compiled binary at: $APP_PATH"
+          
+          # Copy the compiled application tree into the Payload environment
+          cp -R "$APP_PATH" ipa_release/Payload/
+          
+          # Zip the structure into a deployment-ready container file
+          cd ipa_release
+          zip -r ../Luanti_Device_Unsigned.ipa Payload/
+          cd ..
+          
+          echo "Successfully packaged Luanti_Device_Unsigned.ipa"
+
+      - name: Upload IPA Artifact to GitHub Dashboard
+        uses: actions/upload-artifact@v4
+        with:
+          name: Luanti-iOS-Device-Build
+          path: Luanti_Device_Unsigned.ipa
+          retention-days: 5
