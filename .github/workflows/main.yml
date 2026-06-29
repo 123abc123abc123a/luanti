@@ -14,18 +14,6 @@ on:
       - 'cmake/Modules/**'
       - 'po/**.po'
       - '.github/workflows/ios.yml'
-  pull_request:
-    paths:
-      - 'lib/**.[ch]'
-      - 'lib/**.cpp'
-      - 'src/**.[ch]'
-      - 'src/**.cpp'
-      - 'irr/**.[ch]'
-      - 'irr/**.cpp'
-      - '**/CMakeLists.txt'
-      - 'cmake/Modules/**'
-      - 'po/**.po'
-      - '.github/workflows/ios.yml'
 
 jobs:
   build-ios-device:
@@ -37,9 +25,11 @@ jobs:
           repository: luanti-org/luanti
           ref: refs/pull/15451/head
 
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.2.app/Contents/Developer
+
       - name: Install dependencies
         run: |
-          # Patch scripts to ensure they use iPhoneOS paths
           sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/common.sh
           sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/common.sh
           source ./util/ci/common.sh
@@ -49,43 +39,62 @@ jobs:
         run: |
           mkdir build
           cd build
-          
-          # 1. Define paths and environment
+
           export DEVELOPER_DIR=/Applications/Xcode_16.2.app/Contents/Developer
           export DEPS_DIR=/Users/Shared/ios18.2_deps/iPhoneOS
-          
-          # 2. Configure CMake with explicit dependency paths
+
+          # Sanity check that the deps actually exist
+          if [ ! -d "$DEPS_DIR" ]; then
+            echo "ERROR: DEPS_DIR not found: $DEPS_DIR"
+            ls -la /Users/Shared/ || true
+            exit 1
+          fi
+
+          # 1. Run CMake with explicit paths to pre-compiled libraries
           cmake .. -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT=iphoneos \
-            -DCMAKE_PREFIX_PATH=$DEPS_DIR \
-            -DJPEG_LIBRARY=$DEPS_DIR/lib/libjpeg.a \
-            -DJPEG_INCLUDE_DIR=$DEPS_DIR/include \
-            -DZSTD_LIBRARY=$DEPS_DIR/lib/libzstd.a \
-            -DZSTD_INCLUDE_DIR=$DEPS_DIR/include
-          
-          # 3. Force Manual Signing in the generated project
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_PREFIX_PATH="$DEPS_DIR" \
+            -DPNG_LIBRARY="$DEPS_DIR/lib/libpng.a" \
+            -DPNG_PNG_INCLUDE_DIR="$DEPS_DIR/include" \
+            -DJPEG_LIBRARY="$DEPS_DIR/lib/libjpeg.a" \
+            -DJPEG_INCLUDE_DIR="$DEPS_DIR/include" \
+            -DZSTD_LIBRARY="$DEPS_DIR/lib/libzstd.a" \
+            -DZSTD_INCLUDE_DIR="$DEPS_DIR/include"
+
+          # 2. PATCH: Force Manual Signing in the generated project
           sed -i '' 's/ProvisioningStyle = Automatic;/ProvisioningStyle = Manual;/g' luanti.xcodeproj/project.pbxproj
-          
-          # 4. Build with explicit signing overrides
-          xcodebuild -project luanti.xcodeproj -target luanti -configuration Release -sdk iphoneos \
-            DEVELOPER_DIR=$DEVELOPER_DIR \
+
+          # 3. Build with explicit overrides to bypass signing.
+          #    Remove -allowProvisioningUpdates (it requires a team/account and
+          #    conflicts with disabling code signing).
+          xcodebuild \
+            -project luanti.xcodeproj \
+            -target luanti \
+            -configuration Release \
+            -sdk iphoneos \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_ENTITLEMENTS="" \
             DEVELOPMENT_TEAM="" \
-            PROVISIONING_PROFILE_SPECIFIER="" \
-            -allowProvisioningUpdates
+            PROVISIONING_PROFILE_SPECIFIER=""
 
       - name: Package .ipa
         run: |
           mkdir -p ipa_release/Payload
           APP_PATH=$(find build -name "*.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: No .app bundle found under build/"
+            find build -name "*.app" -o -name "*.app.dSYM" || true
+            exit 1
+          fi
+          echo "Found app at: $APP_PATH"
           cp -R "$APP_PATH" ipa_release/Payload/
           cd ipa_release
           zip -r ../Luanti_Device_Unsigned.ipa Payload/
-          
+
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
