@@ -50,22 +50,22 @@ jobs:
 
       - name: Install deps
         run: |
+          # FIX: Intercept and force the toolchain script to compile dependencies for iPhoneOS instead of the Simulator
+          sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/common.sh
+          sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/common.sh
+          sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/build_ios.sh
+          sed -i '' 's/iPhoneSimulator/iPhoneOS/g' util/ci/build_ios.sh
+          
           source ./util/ci/common.sh
           install_ios_deps $osver
 
       - name: Build for iPhone Hardware
         run: |
-          # 1. Change lowercase target platform to compile for a device
-          sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/build_ios.sh
-          
-          # 2. FIX: Precisely patch SDK directory traversal without messing up the dependencies path
-          sed -i '' 's/\.\.\/iPhoneSimulator/\.\.\/iPhoneOS/g' util/ci/build_ios.sh
-          
           mkdir build
           cd build
           
-          # Use the populated simulator folder (unmodified by sed) where Zstd is located
-          export DEPS_DIR=/Users/Shared/ios${osver}_deps/iPhoneSimulator
+          # Explicitly target the newly generated physical hardware dependencies directory
+          export DEPS_DIR=/Users/Shared/ios${osver}_deps/iPhoneOS
           export SDK=iphoneos
           export PLATFORM=OS
           
