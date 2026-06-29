@@ -36,7 +36,6 @@ jobs:
         xcodever: [16.2]
     runs-on: macos-15
     steps:
-      # FIX: Targets the active pull request repository layout containing the iOS toolchains
       - name: Checkout iOS PR Source Code
         uses: actions/checkout@v4
         with:
@@ -52,16 +51,18 @@ jobs:
       - name: Install deps
         run: |
           source ./util/ci/common.sh
-          # Successfully executes now that the PR shell files are present
           install_ios_deps $osver
 
       - name: Build for iPhone Hardware
         run: |
+          # FIX: Forcefully patch the upstream build automation script to output an iPhone device binary
+          sed -i '' 's/iphonesimulator/iphoneos/g' util/ci/build_ios.sh
+          
           mkdir build
           cd build
           
-          # Force the environment to target the physical device SDK (iphoneos) instead of the simulator
-          export DEPS_DIR=/Users/Shared/ios${osver}_deps/iPhoneOS
+          # Use the populated dependencies tree directory so CMake successfully resolves Zstd
+          export DEPS_DIR=/Users/Shared/ios${osver}_deps/iPhoneSimulator
           export SDK=iphoneos
           export PLATFORM=OS
           
