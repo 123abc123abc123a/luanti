@@ -5,11 +5,12 @@ on:
 
 env:
   DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
-  IOS_OSVER: "18.2"
   XCODE_VER: "16.2"
   ARCH: iPhoneOS
   DEPS_WORK: /Users/runner/ios_deps_work
   INSTALL_DIR: /Users/runner/ios_install/iPhoneOS
+  # IOS_OSVER is no longer hard-coded. It is resolved at runtime from the
+  # iOS SDK actually installed on the runner (see "Resolve installed iOS SDK").
 
 jobs:
   build-ios-device:
@@ -36,18 +37,46 @@ jobs:
           echo "mac SDK: $(xcrun --sdk macosx --show-sdk-version)"
           echo "ios SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
 
+      - name: Resolve installed iOS SDK version
+        run: |
+          IOS_SDK_VER=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "Detected iOS SDK: $IOS_SDK_VER"
+          # angle.sh forces ios_sdk_version = "$osver"; make $osver match the
+          # SDK that is actually present so it never hunts for a missing
+          # version-named iPhoneOS<X>.sdk.
+          echo "IOS_OSVER=$IOS_SDK_VER" >> "$GITHUB_ENV"
+
+      - name: Verify iOS SDK path is real (not a dangling symlink)
+        run: |
+          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "Active iphoneos SDK path: $SDK_PATH"
+          ls -ld "$SDK_PATH"
+          PLAT_SDKS="$(dirname "$SDK_PATH")"
+          echo "=== Available iOS SDKs ==="
+          ls -l "$PLAT_SDKS"
+          # Confirm the version-named SDK ANGLE will look for exists & resolves.
+          VER_SDK="$PLAT_SDKS/iPhoneOS${IOS_OSVER}.sdk"
+          if [ -e "$VER_SDK" ]; then
+            echo "OK: $VER_SDK resolves to -> $(readlink -f "$VER_SDK")"
+          else
+            echo "::error::Expected $VER_SDK does not exist. IOS_OSVER ($IOS_OSVER) does not match the installed SDK."
+            exit 1
+          fi
+
       - name: Install host build tools (required by deps.sh)
         run: |
           brew install nasm m4 autoconf automake libtool
 
       # NOTE on args.gn:
-      #   angle.sh copies data/args.gn -> angle/out/args.gn and then itself
-      #   overwrites ios_sdk_version and target_environment. The only thing
-      #   worth correcting up-front is the stale mac SDK version so `gn gen`
-      #   doesn't choke on a version the runner's Xcode doesn't have.
+      #   The previous failure ("Requested target sysroot SDK does not found
+      #   iPhoneOS18.2.sdk") was caused by pinning SDK versions in args.gn.
+      #   angle.sh ALREADY rewrites ios_sdk_version itself, and Chromium's
+      #   sysroot resolver derives the mac/ios SDK from the active Xcode via
+      #   xcrun. Pinning versions here breaks that resolution, so we strip all
+      #   SDK version pins and let GN auto-detect.
       #   Do NOT add use_system_xcode / ios_use_xcode_symlinks: those are not
       #   valid ANGLE GN args and will break `gn gen`.
-      - name: Patch ANGLE GN args (correct stale mac SDK version only)
+      - name: Sanitize ANGLE GN args (let GN auto-detect SDKs)
         run: |
           cd ios_deps
           GNFILE=data/args.gn
@@ -55,28 +84,31 @@ jobs:
           echo "=== Original data/args.gn ==="
           cat "$GNFILE"
 
-          MAC_SDK=$(xcrun --sdk macosx --show-sdk-version)   # e.g. 15.2
-
-          sed -i.bak "s/^mac_sdk_min = .*/mac_sdk_min = \"$MAC_SDK\"/"      "$GNFILE"
-          sed -i.bak "s/^mac_sdk_version = .*/mac_sdk_version = \"$MAC_SDK\"/" "$GNFILE"
-
+          sed -i.bak \
+            -e '/^mac_sdk_min[[:space:]]*=/d' \
+            -e '/^mac_sdk_version[[:space:]]*=/d' \
+            -e '/^ios_sdk_version[[:space:]]*=/d' \
+            "$GNFILE"
           rm -f "$GNFILE.bak"
-          echo "=== Patched data/args.gn ==="
+
+          echo "=== Sanitized data/args.gn ==="
           cat "$GNFILE"
 
       # --- Caching to avoid the very slow ANGLE download/sync on retries ---
+      # Cache keys bumped to v5: the previous run cached a poisoned/partial
+      # work tree (failed in `gn gen`) and a broken args.gn. Do not restore it.
       - name: Cache ANGLE / deps work dir
         uses: actions/cache@v4
         with:
           path: ${{ env.DEPS_WORK }}
-          key: ios-deps-work-${{ env.ARCH }}-${{ env.IOS_OSVER }}-v4
+          key: ios-deps-work-${{ env.ARCH }}-${{ env.IOS_OSVER }}-v5
 
       - name: Cache iOS deps install
         id: deps-cache
         uses: actions/cache@v4
         with:
           path: ${{ env.INSTALL_DIR }}
-          key: ios-deps-install-${{ env.ARCH }}-${{ env.IOS_OSVER }}-v4
+          key: ios-deps-install-${{ env.ARCH }}-${{ env.IOS_OSVER }}-v5
 
       - name: Build iOS dependencies (incl. ANGLE)
         if: steps.deps-cache.outputs.cache-hit != 'true'
