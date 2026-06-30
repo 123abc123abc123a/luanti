@@ -36,7 +36,18 @@ jobs:
           echo "mac SDK: $(xcrun --sdk macosx --show-sdk-version)"
           echo "ios SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
 
-      - name: Patch ANGLE GN args (fix SDK/sysroot resolution)
+      - name: Install host build tools (required by deps.sh)
+        run: |
+          brew install nasm m4 autoconf automake libtool
+
+      # NOTE on args.gn:
+      #   angle.sh copies data/args.gn -> angle/out/args.gn and then itself
+      #   overwrites ios_sdk_version and target_environment. The only thing
+      #   worth correcting up-front is the stale mac SDK version so `gn gen`
+      #   doesn't choke on a version the runner's Xcode doesn't have.
+      #   Do NOT add use_system_xcode / ios_use_xcode_symlinks: those are not
+      #   valid ANGLE GN args and will break `gn gen`.
+      - name: Patch ANGLE GN args (correct stale mac SDK version only)
         run: |
           cd ios_deps
           GNFILE=data/args.gn
@@ -46,17 +57,8 @@ jobs:
 
           MAC_SDK=$(xcrun --sdk macosx --show-sdk-version)   # e.g. 15.2
 
-          # 1) Correct the stale mac SDK versions to match the runner's Xcode.
-          sed -i.bak "s/^mac_sdk_min = .*/mac_sdk_min = \"$MAC_SDK\"/" "$GNFILE"
+          sed -i.bak "s/^mac_sdk_min = .*/mac_sdk_min = \"$MAC_SDK\"/"      "$GNFILE"
           sed -i.bak "s/^mac_sdk_version = .*/mac_sdk_version = \"$MAC_SDK\"/" "$GNFILE"
-
-          # 2) Tell GN to use the installed Xcode and NOT rely on symlink-based
-          #    SDK staging. The runner's iPhoneOS18.2.sdk is only a symlink to
-          #    iPhoneOS.sdk, which breaks ANGLE's version-named SDK lookup
-          #    ("Requested target sysroot SDK does not found iPhoneOS18.2.sdk").
-          #    Only append keys that aren't already present.
-          grep -q "^use_system_xcode" "$GNFILE"        || echo 'use_system_xcode = true'        >> "$GNFILE"
-          grep -q "^ios_use_xcode_symlinks" "$GNFILE"  || echo 'ios_use_xcode_symlinks = false'  >> "$GNFILE"
 
           rm -f "$GNFILE.bak"
           echo "=== Patched data/args.gn ==="
@@ -67,14 +69,14 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.DEPS_WORK }}
-          key: ios-deps-work-${{ env.ARCH }}-${{ env.IOS_OSVER }}-v3
+          key: ios-deps-work-${{ env.ARCH }}-${{ env.IOS_OSVER }}-v4
 
       - name: Cache iOS deps install
         id: deps-cache
         uses: actions/cache@v4
         with:
           path: ${{ env.INSTALL_DIR }}
-          key: ios-deps-install-${{ env.ARCH }}-${{ env.IOS_OSVER }}-v3
+          key: ios-deps-install-${{ env.ARCH }}-${{ env.IOS_OSVER }}-v4
 
       - name: Build iOS dependencies (incl. ANGLE)
         if: steps.deps-cache.outputs.cache-hit != 'true'
@@ -85,28 +87,57 @@ jobs:
           chmod +x build.sh deps.sh angle.sh || true
 
           # build.sh <where_deps> <where_install> <arch> <osver> <step>
-          # Note: angle.sh clones depot_tools itself, so we don't pre-clone it.
+          # build.sh calls build_ios_angle with an EMPTY xcodever, so it will
+          # NOT re-run xcode-select; we already selected Xcode 16.2 above.
+          # angle.sh clones depot_tools itself, so we don't pre-clone it.
           ./build.sh "$DEPS_WORK" "$INSTALL_DIR" "$ARCH" "$IOS_OSVER" all
 
       - name: Inspect installed deps
         run: |
           echo "=== Install tree (top) ==="
           ls -R "$INSTALL_DIR" | head -n 300
+
           echo "=== ANGLE static libs? ==="
-          find "$INSTALL_DIR" -name 'libANGLE_static.a' -o -name 'libEGL_static.a' -o -name 'libGLESv2_static.a' || echo "ANGLE libs NOT FOUND"
+          missing=0
+          for lib in libANGLE_static.a libEGL_static.a libGLESv2_static.a; do
+            if find "$INSTALL_DIR" -name "$lib" | grep -q .; then
+              echo "FOUND: $lib"
+            else
+              echo "MISSING: $lib"
+              missing=1
+            fi
+          done
+
           echo "=== EGL headers (under ANGLE)? ==="
-          find "$INSTALL_DIR" -path "*ANGLE*" -name "egl.h" || echo "egl.h NOT FOUND"
+          if find "$INSTALL_DIR" -path "*ANGLE*" -name "egl.h" | grep -q .; then
+            find "$INSTALL_DIR" -path "*ANGLE*" -name "egl.h"
+          else
+            echo "egl.h NOT FOUND"
+            missing=1
+          fi
+
           echo "=== SDL2 config ==="
           find "$INSTALL_DIR" \( -iname 'SDL2Config.cmake' -o -iname 'sdl2-config.cmake' \) || true
           echo "=== Freetype ==="
           find "$INSTALL_DIR" -name 'libfreetype*' || true
+
+          if [ "$missing" = "1" ]; then
+            echo "::error::Required ANGLE artifacts are missing from the install tree."
+            exit 1
+          fi
 
       - name: Configure (CMake)
         run: |
           cd luanti
           mkdir build && cd build
           DEPS="$INSTALL_DIR"
-          SDL2_CFG_DIR=$(dirname "$(find "$DEPS" \( -iname 'SDL2Config.cmake' -o -iname 'sdl2-config.cmake' \) -print -quit)")
+
+          SDL2_CFG=$(find "$DEPS" \( -iname 'SDL2Config.cmake' -o -iname 'sdl2-config.cmake' \) -print -quit)
+          if [ -z "$SDL2_CFG" ]; then
+            echo "::error::Could not locate SDL2 CMake config under $DEPS"
+            exit 1
+          fi
+          SDL2_CFG_DIR=$(dirname "$SDL2_CFG")
           echo "SDL2_DIR -> $SDL2_CFG_DIR"
 
           cmake .. -G Xcode \
@@ -127,6 +158,7 @@ jobs:
           xcodebuild -project luanti.xcodeproj -list
 
           set -o pipefail
+          BUILD_FAILED=0
           xcodebuild \
             -project luanti.xcodeproj -target luanti -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' \
@@ -135,11 +167,15 @@ jobs:
             2>&1 | tee xcodebuild_full.log || BUILD_FAILED=1
 
           echo "================ ERROR SUMMARY ================"
-          grep -n -i -E "error:|fatal error|undefined symbol|symbol\(s\) not found|ld: " \
+          # Anchor on real diagnostics; avoid matching "0 errors" / paths with "error".
+          grep -n -E "(^| )(error:|fatal error:)|Undefined symbols|symbol\(s\) not found|^ld: |clang: error:" \
             xcodebuild_full.log | head -n 60 || echo "No explicit error lines matched."
           echo "================ LAST 60 LINES ================"
           tail -n 60 xcodebuild_full.log
-          if [ "${BUILD_FAILED:-0}" = "1" ]; then exit 65; fi
+
+          if [ "$BUILD_FAILED" = "1" ]; then
+            exit 65
+          fi
 
       - name: Upload build log
         if: always()
@@ -151,6 +187,7 @@ jobs:
 
       - name: Package sideload-ready .ipa
         run: |
+          set -e
           cd luanti
           APP_PATH=$(find build -type d -name "*.app" ! -name "*.dSYM" | head -n 1)
           if [ -z "$APP_PATH" ]; then
@@ -177,8 +214,9 @@ jobs:
           mkdir -p ipa_release/Payload
           cp -R "$APP_PATH" ipa_release/Payload/
           cd ipa_release
-          zip -r ../../Luanti_Sideload.ipa Payload/ -x "*.DS_Store"
-          unzip -l ../../Luanti_Sideload.ipa | head -n 40
+          # Write the .ipa to an absolute path so the upload step is unambiguous.
+          zip -r "$GITHUB_WORKSPACE/Luanti_Sideload.ipa" Payload/ -x "*.DS_Store"
+          unzip -l "$GITHUB_WORKSPACE/Luanti_Sideload.ipa" | head -n 40
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
